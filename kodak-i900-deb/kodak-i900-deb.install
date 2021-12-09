@@ -1,0 +1,159 @@
+post_install() {
+	/sbin/ldconfig
+
+	# Check for Kodak scanner information in /etc/udev/rules.d/55-kodakdi.rules (if
+	# it exists) and add the info. If it doesn't exist create it.
+
+	# remove line
+	# if it starts with a comment, then remove entire line
+	# if it starts with "ATTRS{idProduct}=="6012", ATTRS{idVendor}=="040a"", then
+	#    remove the line by looking at the first  49 characters
+	#
+	# $1 - the line to remove
+	# $2 - the file to remove it from
+	remove_line()
+	{
+	  # find the line using case-insensitive grep search
+	  if [ "${1:0:1}" == "#" ]; then
+	    # starts with a comment, so use entire string
+	    NEWFILECONTENTS=`cat ${2} | grep -i -v "^$1.*$"`
+	  elif [ "${1:0:16}" == "ATTRS{idProduct}" ]; then
+	    # is "ATTRS{idProduct}", so use first 49 characters (i.e. PID & VID)
+	    NEWFILECONTENTS=`cat ${2} | grep -i -v "^${1:0:49}.*$"`
+	  elif [ "${1:0:16}" == "ACTION==\"remove\"" ]; then
+	    # is "ACTION=="remove"", so get full path by spliting at space
+	    # and then taking the first two parts (i.e. ACTION & RUN with path)
+	    IFSremoveline=$IFS
+	    IFS=" "
+	    LINEPARTS=( ${1} )
+	    IFS=$IFSremoveline	# put back the old value
+	    LINESEARCH="${LINEPARTS[0]}"" ""${LINEPARTS[1]}"
+	    NEWFILECONTENTS=`cat ${2} | grep -i -v "^${LINESEARCH}.*$"`
+	  else
+	    # not a line we know about, so nothing to search
+	    return
+	  fi
+
+	  # write out the new file
+	  # NOTE: we do this here instead of when we do the cat & grep
+	  #       becase we had to. if we didn't, the file would get
+	  #       wiped out. some odd thing with scripts that was to
+	  #       time consuming to bother to figure out
+	  echo "${NEWFILECONTENTS}" > ${2}
+	}
+
+	rulesfile="/etc/udev/rules.d/55-kodakdi.rules"
+	if [ ! -f "$rulesfile" ]; then
+	  echo "# This file contains rules to make Kodak document scanner device node" >> $rulesfile
+	  echo "# readable and writable by the owner and members of the users group" >> $rulesfile
+	  echo "# If you want to restrict or relax these permission you should do so" >> $rulesfile
+	  echo "# by changing the mode and group below, as neccessary." >> $rulesfile
+	  echo >> $rulesfile
+	fi
+
+	RULES_LINE[0]="# Kodak i900"
+	RULES_LINE[1]="ATTRS{idVendor}==\"040a\", ATTRS{idProduct}==\"602a\", MODE=\"0660\", GROUP=\"scanner\", RUN+=\"/opt/kodak/kds_i900/pnphelper action:add\", ENV{libsane_matched}=\"yes\""
+	RULES_LINE[2]="# KODAK i920 Scanner"
+	RULES_LINE[3]="ATTRS{idProduct}==\"6029\", ATTRS{idVendor}==\"040a\", MODE:=\"660\", GROUP=\"scanner\", RUN+=\"/opt/kodak/kds_i900/pnphelper action:add\", ENV{libsane_matched}=\"yes\""
+	RULES_LINE[4]="# KODAK i940 Scanner"
+	RULES_LINE[5]="ATTRS{idProduct}==\"602a\", ATTRS{idVendor}==\"040a\", MODE:=\"660\", GROUP=\"scanner\", RUN+=\"/opt/kodak/kds_i900/pnphelper action:add\", ENV{libsane_matched}=\"yes\""
+	RULES_LINE[6]="ACTION==\"remove\", RUN+=\"/opt/kodak/kds_i900/pnphelper action:remove\""
+
+
+	# remove old lines
+	IFSmain=$IFS
+	IFS=""
+	for rule_line in ${RULES_LINE[*]}
+	do
+	  remove_line "$rule_line" $rulesfile
+	done
+	IFS=$IFSmain
+
+	# add lines
+	IFSmain=$IFS
+	IFS=""
+	echo "" >> ${rulesfile}
+	for rule_line in ${RULES_LINE[*]}
+	do
+	  echo "$rule_line" >> ${rulesfile}
+	done
+	IFS=$IFSmain
+
+	# update any old information
+	sed -i 's/SYSFS=/ATTRS:=/g' $rulesfile
+	sed -i 's/MODE=/MODE:=/g' $rulesfile
+
+	# We need to make sure that the libusb device nodes are created properly. Make sure
+	# the udev rule to do this exists, if it doesn't add it or if it's incorrect fix it
+	# This "scriptlet" is here because of a problem with some of the demo PCs. On most
+	# distros this won't be a problem. Only make the fix if the rules file exists
+	rulesfile="/etc/udev/rules.d/50-udev-default.rules"
+	if [ -f $rulesfile ]; then
+	  if ! grep "printf bus/usb/" $rulesfile > /dev/null; then
+	    # It doesn't exist add it
+	    echo "" >> $rulesfile
+	    echo "# libusb device access" >> $rulesfile
+	    echo "SUBSYSTEM==\"usb_device\", PROGRAM=\"/usr/bin/bash -c 'K=%k; K=$${K#usbdev}; printf bus/usb/%03i/%03i $${K%%.*} $${K#*.}'\", NAME=\"%c\", MODE=\"0644\"" >> $rulesfile
+	    echo "" >> $rulesfile
+	  else
+	    # It exists, let's make sure we have the right form
+	    sed -i.backup -e 's/printf bus\/usb\/.*\/.*i /printf bus\/usb\/\%\%03i\/\%\%03i /' $rulesfile
+	  fi
+	fi
+
+	# make sure the new rules are in effect (in case of upgrade and restart script not found)
+	udevadm=`which udevadm`
+	if [ ! $udevadm == "" ]; then
+	  udevadm control --reload-rules > /dev/null
+	fi
+
+	# Restart the udev service to include our new rules (make sure the script exists first)!
+	udevinitd="/etc/init.d/boot.udev"
+	if [ -f $udevinitd ]; then
+	  $udevinitd restart > /dev/null
+	fi
+
+	# Change the permissions of the /var/kodak directory
+	mkdir -p /var/kodak
+	mkdir -p /var/kodak/common
+	mkdir -p /var/kodak/kds_i900/sanetwain
+	chmod -R 777 /var/kodak
+
+	# Now we need to make sure the kds backend is enabled in /etc/sane.d/dll.conf
+	sanedllconf="/etc/sane.d/dll.conf"
+	if [ -f $sanedllconf ]; then
+	  if ! grep "^kds_i900$" $sanedllconf > /dev/null; then
+	    echo "kds_i900" >> $sanedllconf
+	  fi
+	fi
+
+	# Create sanetwain symbolic links in /usr/lib/sane
+	ln -sf /usr/lib/sane/libsane-kds_i900.so.1.0.24 /usr/lib/sane/libsane-kds_i900.so
+	ln -sf /usr/lib/sane/libsane-kds_i900.so.1.0.24 /usr/lib/sane/libsane-kds_i900.so.1
+	ln -sf /usr/lib/sane/libsane-kds_i900.lai /usr/lib/sane/libsane-kds_i900.la
+	# Create sanetwain symbolic links in /usr/lib64/sane (only on select distros)
+	if [ -d /usr/lib64/sane ]; then
+	  ln -sf /usr/lib/sane/libsane-kds_i900.so.1.0.24 /usr/lib64/sane/libsane-kds_i900.so
+	  ln -sf /usr/lib/sane/libsane-kds_i900.so.1.0.24 /usr/lib64/sane/libsane-kds_i900.so.1
+	  ln -sf /usr/lib/sane/libsane-kds_i900.lai /usr/lib64/sane/libsane-kds_i900.la
+	fi
+}
+
+post_upgrade() {
+	post_install
+}
+
+post_remove() {
+	/sbin/ldconfig
+
+	if [ ! -f /usr/lib/sane/libsane-kds_i900.so.1.0.24 ]; then
+	  # If sanetwain has been removed, then remove the sanetwain symbolic links
+	  rm -rf /usr/lib/sane/libsane-kds_i900.so /usr/lib/sane/libsane-kds_i900.so.1 /usr/lib/sane/libsane-kds_i900.la
+	  if [ -d /usr/lib64/sane ]; then
+	    rm -rf /usr/lib64/sane/libsane-kds_i900.so /usr/lib64/sane/libsane-kds_i900.so.1 /usr/lib64/sane/libsane-kds_i900.la
+	  fi
+	fi
+	if [ ! -f /usr/lib/sane/libsane-kds_i900.so.1.0.24 ]; then
+	  rm -rf /var/kodak/kds_i900/sanetwain
+	fi
+}
